@@ -1,6 +1,7 @@
 """The tests for the Ring platform."""
 
 import asyncio
+import logging
 from base64 import standard_b64encode, urlsafe_b64decode
 
 import pytest
@@ -9,7 +10,7 @@ from cryptography.hazmat.primitives.serialization import load_der_private_key
 from http_ece import encrypt
 
 from firebase_messaging import FcmPushClient, FcmRegisterConfig
-from firebase_messaging.fcmpushclient import FcmPushClientRunState
+from firebase_messaging.fcmpushclient import FcmPushClientRunState, _header_param
 from firebase_messaging.proto.mcs_pb2 import (
     Close,
     DataMessageStanza,
@@ -251,3 +252,220 @@ async def test_decrypt():
     )
 
     assert raw_data_decrypted == raw_data
+
+
+# Values below are copied verbatim from the specifications that define these
+# header fields, so the parser is exercised against the real grammar rather
+# than against invented input.
+#
+# draft-ietf-webpush-encryption-04 section 4.2:
+#     Encryption: salt="lngarbyKfMoi9Z75xYXmkg"
+#     Crypto-Key: dh="BNoRDbb84JGm8g5Z5CFxurSqsXWJ11ItfXEWYVLE85Y7CYkDjXsIE
+#                     c4aqxYaQ1G8BqkXCJ6DPpDrWtdWj_mugHU"
+SPEC_DH = "BNoRDbb84JGm8g5Z5CFxurSqsXWJ11ItfXEWYVLE85Y7CYkDjXsIEc4aqxYaQ1G8BqkXCJ6DPpDrWtdWj_mugHU"
+SPEC_SALT = "lngarbyKfMoi9Z75xYXmkg"
+# draft-ietf-httpbis-encryption-encoding-03 section 3.2:
+#     Encryption: keyid="a1"; salt="vr0o6Uq3w_KDWeatc27mUg"
+#     Encryption: keyid="a1"; salt="4pdat984KmT9BWsU3np0nw"; rs=10
+SPEC_SALT_A1 = "vr0o6Uq3w_KDWeatc27mUg"
+# draft-ietf-webpush-vapid-01 section 2.2.  That section notes that using
+# VAPID "results in two values in the Crypto-Key header field, one with the
+# a 'dh' key and another with a 'p256ecdsa' key", i.e. two comma separated
+# entries in the #list.
+SPEC_P256ECDSA = "BA1Hxzyi1RUM1b5wjxsn7nGxAszw2u61m164i3MrAIxHF6YK5h4SDYic-dRuU_RCPCfA5aq9ojSwk5Y2EmClBPs"
+
+
+@pytest.mark.parametrize(
+    ("header_value", "expected"),
+    [
+        # Quoted single parameter, exactly as the spec example prints it.
+        (f'dh="{SPEC_DH}"', SPEC_DH),
+        # Unquoted, which is the form FCM actually sends.
+        (f"dh={SPEC_DH}", SPEC_DH),
+        # Padded, which is also what FCM sends today for a 65 byte P-256 key.
+        (f"dh={SPEC_DH}=", f"{SPEC_DH}="),
+        # keyid is optional and may sit on either side of dh.
+        (f'keyid="a1";dh={SPEC_DH}', SPEC_DH),
+        (f'dh={SPEC_DH};keyid="a1"', SPEC_DH),
+        # VAPID adds a second entry to the list, in either order.
+        (f"dh={SPEC_DH},p256ecdsa={SPEC_P256ECDSA}", SPEC_DH),
+        (f"p256ecdsa={SPEC_P256ECDSA},dh={SPEC_DH}", SPEC_DH),
+        # OWS is permitted around the separators.
+        (f"dh={SPEC_DH} , p256ecdsa={SPEC_P256ECDSA}", SPEC_DH),
+        (f'keyid = "a1" ; dh = {SPEC_DH}', SPEC_DH),
+    ],
+    ids=[
+        "quoted",
+        "unquoted",
+        "padded",
+        "keyid-first",
+        "keyid-last",
+        "vapid-dh-first",
+        "vapid-dh-last",
+        "ows-around-comma",
+        "ows-around-semicolon",
+    ],
+)
+def test_header_param_crypto_key(header_value, expected):
+    """dh must be found by name, wherever it sits in the Crypto-Key #list."""
+    assert _header_param(header_value, "dh") == expected
+
+
+@pytest.mark.parametrize(
+    ("header_value", "expected"),
+    [
+        (f'salt="{SPEC_SALT}"', SPEC_SALT),
+        (f"salt={SPEC_SALT}", SPEC_SALT),
+        # The padded form carried by the data_message_stanza fixture.
+        ("salt=zZYXWVUTSRQ12yxwvutsrq==", "zZYXWVUTSRQ12yxwvutsrq=="),
+        # Spec examples put keyid before salt; rs may follow it.
+        (f'keyid="a1"; salt="{SPEC_SALT_A1}"', SPEC_SALT_A1),
+        (f'keyid="a1"; salt="{SPEC_SALT_A1}"; rs=10', SPEC_SALT_A1),
+        # Same parameters, swapped round.
+        (f'rs=10; salt="{SPEC_SALT_A1}"; keyid="a1"', SPEC_SALT_A1),
+        (f"salt={SPEC_SALT};rs=4096", SPEC_SALT),
+    ],
+    ids=[
+        "quoted",
+        "unquoted",
+        "padded-fixture-form",
+        "keyid-first",
+        "keyid-first-with-rs",
+        "rs-first",
+        "rs-last",
+    ],
+)
+def test_header_param_encryption(header_value, expected):
+    """salt must be found by name, wherever it sits in the Encryption #list."""
+    assert _header_param(header_value, "salt") == expected
+
+
+def test_header_param_missing():
+    """A header without the parameter raises ValueError, not a slicing bug.
+
+    An application server MUST include "at most one entry having a 'dh'
+    parameter" (draft-ietf-webpush-encryption-04 section 4.2), so a
+    Crypto-Key holding only the VAPID key is well formed but unusable here.
+    """
+    with pytest.raises(ValueError, match="No 'dh' parameter"):
+        _header_param(f"p256ecdsa={SPEC_P256ECDSA}", "dh")
+
+
+def _encrypted_fixture_message():
+    """Encrypt a payload to the fixture credentials, as a sender would.
+
+    Returns the stanza, the credentials, the sender's public key (unpadded)
+    and the salt, so tests can assemble header values around them.
+    """
+    dms = load_fixture_as_msg("data_message_stanza.json", DataMessageStanza)
+    credentials = load_fixture_as_dict("credentials.json")
+    raw_data = b'{ "foo" : "bar" }'
+
+    salt_str = _app_data(dms, "encryption")[5:]
+    salt = urlsafe_b64decode(salt_str.encode("ascii"))
+    sender_pub = "BAGEFtID7WlmwzQ9pbjdRYAhfPe7Z8lA3ZGIPUh0SE3ikoY2PIrWUP0rmhpE4Kl8ImgMUDjKWrz0WmtLxORIHuw"
+    sender_pri_der = urlsafe_b64decode(
+        "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgwSUpDfIqdJG3XVkn7t1GExHuW3gsqD4-J525w-rnCIihRANCAAQBhBbSA-1pZsM0PaW43UWAIXz3u2fJQN2RiD1IdEhN4pKGNjyK1lD9K5oaROCpfCJoDFA4ylq89FprS8TkSB7s".encode(
+            "ascii"
+        )
+        + b"========"
+    )
+    sender_privkey = load_der_private_key(
+        sender_pri_der, password=None, backend=default_backend()
+    )
+    dms.raw_data = encrypt(
+        raw_data,
+        salt=salt,
+        private_key=sender_privkey,
+        dh=urlsafe_b64decode(credentials["keys"]["public"].encode("ascii") + b"="),
+        version="aesgcm",
+        auth_secret=urlsafe_b64decode(
+            credentials["keys"]["secret"].encode("ascii") + b"========"
+        ),
+    )
+    return dms, credentials, sender_pub, salt_str
+
+
+def _app_data(msg, key):
+    for x in msg.app_data:
+        if x.key == key:
+            return x.value
+    return None
+
+
+def _set_app_data(msg, key, value):
+    for x in msg.app_data:
+        if x.key == key:
+            x.value = value
+
+
+@pytest.mark.parametrize(
+    ("crypto_key_template", "encryption_template"),
+    [
+        # Control case: what FCM sends today, a lone padded parameter in
+        # each header.  This is the only shape the old slicing handled.
+        ("dh={dh}=", "salt={salt}=="),
+        # Unpadded, as the specs encode base64url values.
+        ("dh={dh}", "salt={salt}"),
+        # VAPID: a second entry in the Crypto-Key list.  Decoding the whole
+        # header tail happened to work before Python 3.14.4 because the
+        # decoder stopped at the padding of the dh value.
+        ("dh={dh}=,p256ecdsa=" + SPEC_P256ECDSA, "salt={salt}=="),
+        ("p256ecdsa=" + SPEC_P256ECDSA + ",dh={dh}=", "salt={salt}=="),
+        # keyid/rs present, and the parameters swapped round.
+        ('keyid="a1";dh={dh}=', 'keyid="a1"; salt={salt}==; rs=4096'),
+        ('dh={dh}=;keyid="a1"', "rs=4096; salt={salt}=="),
+        # Quoted values, as printed in the spec examples.
+        ('dh="{dh}"', 'salt="{salt}"'),
+    ],
+    ids=[
+        "padded-dh-only",
+        "unpadded-dh-only",
+        "vapid-dh-first",
+        "vapid-dh-last",
+        "keyid-first",
+        "keyid-last-rs-first",
+        "quoted",
+    ],
+)
+async def test_handle_data_message_header_variants(
+    crypto_key_template, encryption_template
+):
+    """Every well formed header shape must decrypt to the same payload."""
+    dms, credentials, sender_pub, salt_str = _encrypted_fixture_message()
+    _set_app_data(dms, "crypto-key", crypto_key_template.format(dh=sender_pub))
+    _set_app_data(
+        dms, "encryption", encryption_template.format(salt=salt_str.rstrip("="))
+    )
+
+    received = []
+    client = FcmPushClient(
+        lambda ntf, psid, obj: received.append(ntf),
+        FcmRegisterConfig("project-1234", "bar", "foobar", "foobar"),
+        credentials,
+    )
+    client._handle_data_message(dms)
+
+    assert received == [{"foo": "bar"}]
+
+
+async def test_handle_data_message_undecryptable_is_skipped(caplog):
+    """One bad payload is logged and skipped, it must not raise.
+
+    Anything propagating out of here reaches _listen(), which shuts the whole
+    client down, so a single malformed message would stop all notifications.
+    """
+    caplog.set_level(logging.WARNING)
+    dms, credentials, _, _ = _encrypted_fixture_message()
+    _set_app_data(dms, "crypto-key", "p256ecdsa=" + SPEC_P256ECDSA)
+
+    received = []
+    client = FcmPushClient(
+        lambda ntf, psid, obj: received.append(ntf),
+        FcmRegisterConfig("project-1234", "bar", "foobar", "foobar"),
+        credentials,
+    )
+    client._handle_data_message(dms)
+
+    assert received == []
+    assert "Failed to decrypt data for message" in caplog.text
